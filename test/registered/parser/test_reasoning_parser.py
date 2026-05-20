@@ -4,6 +4,7 @@ from sglang.srt.parser.reasoning_parser import (
     BaseReasoningFormatDetector,
     DeepSeekR1Detector,
     KimiDetector,
+    KimiK2ReasoningDetector,
     Qwen3Detector,
     ReasoningParser,
     StreamingParseResult,
@@ -311,6 +312,159 @@ class TestKimiDetector(CustomTestCase):
         result = self.detector.parse_streaming_increment("◁/think▷answer")
         self.assertEqual(result.reasoning_text, "")  # Buffer cleared
         self.assertEqual(result.normal_text, "answer")
+
+
+class TestKimiK2ReasoningDetector(CustomTestCase):
+    """Tests for KimiK2ReasoningDetector that handles tool calls inside thinking blocks."""
+
+    def setUp(self):
+        self.detector = KimiK2ReasoningDetector()
+
+    def test_init(self):
+        """Test KimiK2ReasoningDetector initialization."""
+        self.assertEqual(self.detector.think_start_token, "<think>")
+        self.assertEqual(self.detector.think_end_token, "</think>")
+        self.assertFalse(self.detector._in_reasoning)
+        self.assertEqual(
+            self.detector.TOOL_CALL_SECTION_START, "<|tool_calls_section_begin|>"
+        )
+
+    def test_normal_text_without_thinking(self):
+        """Test normal text passes through unchanged."""
+        text = "Hello, world!"
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.normal_text, text)
+        self.assertEqual(result.reasoning_text, "")
+
+    def test_normal_thinking_without_tool_calls(self):
+        """Test standard thinking block without tool calls works as before."""
+        text = "<think>Let me think about this</think>The answer is 42."
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "Let me think about this")
+        self.assertEqual(result.normal_text, "The answer is 42.")
+
+    def test_tool_calls_inside_thinking_no_end_tag(self):
+        """Test the main bug: tool call tokens inside thinking block without </think>."""
+        text = (
+            "<think>"
+            " <|tool_calls_section_begin|>"
+            "<|tool_call_begin|>functions.Read:0"
+            '<|tool_call_argument_begin|>{"file_path": "/tmp/test.py"}'
+            "<|tool_call_end|>"
+            "<|tool_calls_section_end|>"
+        )
+        result = self.detector.detect_and_parse(text)
+        # Tool call markers must be in normal_text for the tool call parser
+        self.assertIn("<|tool_calls_section_begin|>", result.normal_text)
+        self.assertIn("<|tool_call_begin|>", result.normal_text)
+        # Reasoning should not contain tool call markers
+        self.assertNotIn("<|tool_calls_section_begin|>", result.reasoning_text)
+
+    def test_thinking_then_tool_calls_no_end_tag(self):
+        """Test reasoning followed by tool calls, no </think> tag."""
+        text = (
+            "<think>I should read the file first"
+            "<|tool_calls_section_begin|>"
+            "<|tool_call_begin|>functions.Read:0"
+            '<|tool_call_argument_begin|>{"file_path": "/tmp/test.py"}'
+            "<|tool_call_end|>"
+            "<|tool_calls_section_end|>"
+        )
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "I should read the file first")
+        self.assertIn("<|tool_calls_section_begin|>", result.normal_text)
+
+    def test_tool_calls_inside_thinking_with_end_tag(self):
+        """Test tool calls inside thinking block with </think> after."""
+        text = (
+            "<think>Let me think"
+            "<|tool_calls_section_begin|>"
+            "<|tool_call_begin|>functions.Read:0"
+            '<|tool_call_argument_begin|>{"file_path": "/tmp/test.py"}'
+            "<|tool_call_end|>"
+            "<|tool_calls_section_end|>"
+            "</think>Done."
+        )
+        result = self.detector.detect_and_parse(text)
+        self.assertIn("<|tool_calls_section_begin|>", result.normal_text)
+        self.assertIn("Done.", result.normal_text)
+        self.assertEqual(result.reasoning_text, "Let me think")
+
+    def test_truncated_reasoning_without_tool_calls(self):
+        """Test truncated reasoning (no </think>) without tool calls still works."""
+        text = "<think>I am still thinking about this problem"
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(
+            result.reasoning_text, "I am still thinking about this problem"
+        )
+        self.assertEqual(result.normal_text, "")
+
+    # --- Streaming tests ---
+
+    def test_streaming_tool_calls_in_thinking(self):
+        """Test streaming: tool call markers arrive while in reasoning mode."""
+        # Enter thinking mode
+        result = self.detector.parse_streaming_increment("<think>")
+        self.assertTrue(self.detector._in_reasoning)
+
+        # Some reasoning content
+        result = self.detector.parse_streaming_increment("Let me read the file.")
+        self.assertEqual(result.reasoning_text, "Let me read the file.")
+
+        # Tool call marker arrives — should exit reasoning and return as normal_text
+        result = self.detector.parse_streaming_increment(
+            "<|tool_calls_section_begin|>"
+            "<|tool_call_begin|>functions.Read:0"
+            '<|tool_call_argument_begin|>{"file_path": "/tmp/test.py"}'
+            "<|tool_call_end|>"
+            "<|tool_calls_section_end|>"
+        )
+        self.assertIn("<|tool_calls_section_begin|>", result.normal_text)
+        self.assertFalse(self.detector._in_reasoning)
+
+    def test_streaming_normal_thinking_then_normal_text(self):
+        """Test streaming: normal think/end-think flow still works."""
+        self.detector.parse_streaming_increment("<think>")
+        result = self.detector.parse_streaming_increment("reasoning content")
+        self.assertEqual(result.reasoning_text, "reasoning content")
+
+        result = self.detector.parse_streaming_increment("</think>answer")
+        self.assertEqual(result.normal_text, "answer")
+        self.assertFalse(self.detector._in_reasoning)
+
+    def test_streaming_tool_calls_mixed_in_end_tag_reasoning(self):
+        """Test streaming: tool calls inside reasoning, then </think> arrives."""
+        self.detector.parse_streaming_increment("<think>")
+        self.detector.parse_streaming_increment("thinking...")
+
+        # Tool call marker + end tag in one chunk
+        result = self.detector.parse_streaming_increment(
+            "<|tool_calls_section_begin|>"
+            "<|tool_call_begin|>functions.Read:0"
+            '<|tool_call_argument_begin|>{"file_path": "/tmp/test.py"}'
+            "<|tool_call_end|>"
+            "<|tool_calls_section_end|>"
+        )
+        self.assertIn("<|tool_calls_section_begin|>", result.normal_text)
+
+    def test_parser_uses_kimi_k2_detector(self):
+        """Test that ReasoningParser maps kimi_k2 to KimiK2ReasoningDetector."""
+        parser = ReasoningParser("kimi_k2")
+        self.assertIsInstance(parser.detector, KimiK2ReasoningDetector)
+
+    def test_parser_non_stream_with_tool_calls(self):
+        """Test full pipeline: ReasoningParser.parse_non_stream preserves tool calls."""
+        parser = ReasoningParser("kimi_k2")
+        text = (
+            "<think> <|tool_calls_section_begin|>"
+            "<|tool_call_begin|>functions.Read:15"
+            '<|tool_call_argument_begin|>{"file_path": "/tmp/test.py"}'
+            "<|tool_call_end|>"
+            "<|tool_calls_section_end|>"
+        )
+        reasoning, normal = parser.parse_non_stream(text)
+        self.assertIn("<|tool_calls_section_begin|>", normal)
+        self.assertNotIn("<|tool_calls_section_begin|>", reasoning)
 
 
 class TestReasoningParser(CustomTestCase):
